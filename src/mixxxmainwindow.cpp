@@ -34,10 +34,13 @@
 #endif
 #include "control/controlindicatortimer.h"
 #include "library/library.h"
+#include "library/library_decl.h"
 #include "library/library_prefs.h"
 #ifdef __ENGINEPRIME__
 #include "library/export/libraryexporter.h"
 #endif
+#include "library/library_prefs.h"
+#include "library/overviewcache.h"
 #include "library/trackcollectionmanager.h"
 #include "mixer/playerinfo.h"
 #include "mixer/playermanager.h"
@@ -63,6 +66,11 @@
 #ifdef __VINYLCONTROL__
 #include "vinylcontrol/vinylcontrolmanager.h"
 #endif
+
+//  EveOSC
+#include "osc/oscfunctions.h"
+#include "osc/oscreceiver.cpp"
+//  EveOSC
 
 namespace {
 #ifdef __LINUX__
@@ -95,10 +103,15 @@ MixxxMainWindow::MixxxMainWindow(std::shared_ptr<mixxx::CoreServices> pCoreServi
 #ifndef __APPLE__
           m_prevState(Qt::WindowNoState),
 #endif
+          m_noVinylInputDialog(nullptr),
+          m_noPassthroughInputDialog(nullptr),
+          m_noMicInputDialog(nullptr),
+          m_noAuxInputDialog(nullptr),
           m_pGuiTick(nullptr),
 #ifdef __LINUX__
           m_supportsGlobalMenuBar(supportsGlobalMenu()),
 #endif
+          m_inRebootMixxxView(false),
           m_pDeveloperToolsDlg(nullptr),
           m_pPrefDlg(nullptr),
           m_toolTipsCfg(mixxx::preferences::Tooltips::On) {
@@ -119,6 +132,12 @@ MixxxMainWindow::MixxxMainWindow(std::shared_ptr<mixxx::CoreServices> pCoreServi
                 CmdlineArgs::Instance().getStartInFullscreen() || fullscreenPref);
     }
 #endif // __LINUX__
+
+    connect(m_pCoreServices.get(),
+            &mixxx::CoreServices::libraryScanSummary,
+            this,
+            &MixxxMainWindow::slotLibraryScanSummaryDlg);
+
     createMenuBar();
     m_pMenuBar->hide();
 
@@ -134,6 +153,9 @@ MixxxMainWindow::MixxxMainWindow(std::shared_ptr<mixxx::CoreServices> pCoreServi
 
     m_pGuiTick = new GuiTick();
     m_pVisualsManager = new VisualsManager();
+    // EveOSC
+    oscEnable();
+    // EveOSC
 }
 
 #ifdef MIXXX_USE_QOPENGL
@@ -194,6 +216,10 @@ void MixxxMainWindow::initialize() {
             &Library::exportCrate,
             m_pLibraryExporter.get(),
             &mixxx::LibraryExporter::slotRequestExportWithInitialCrate);
+    connect(m_pCoreServices->getLibrary().get(),
+            &Library::exportPlaylist,
+            m_pLibraryExporter.get(),
+            &mixxx::LibraryExporter::slotRequestExportWithInitialPlaylist);
 #endif
 
     // Turn on fullscreen mode
@@ -273,7 +299,19 @@ void MixxxMainWindow::initialize() {
 
     WaveformWidgetFactory::createInstance(); // takes a long time
     WaveformWidgetFactory::instance()->setConfig(m_pCoreServices->getSettings());
-    WaveformWidgetFactory::instance()->startVSync(m_pGuiTick, m_pVisualsManager);
+    WaveformWidgetFactory::instance()->startVSync(m_pGuiTick, m_pVisualsManager, false);
+    // Connect OverviewCache so we can clear and re-render overviews in the library
+    // when "OverviewNormalized" or "VisualGain_0" (all) have been changed in the
+    // preferences.
+    auto* pOverviewCache = OverviewCache::instance();
+    connect(WaveformWidgetFactory::instance(),
+            &WaveformWidgetFactory::visualGainChanged,
+            pOverviewCache,
+            &OverviewCache::onNormalizeOrVisualGainChanged);
+    connect(WaveformWidgetFactory::instance(),
+            &WaveformWidgetFactory::overviewNormalizeChanged,
+            pOverviewCache,
+            &OverviewCache::onNormalizeOrVisualGainChanged);
 
     connect(this,
             &MixxxMainWindow::skinLoaded,
@@ -514,10 +552,29 @@ MixxxMainWindow::~MixxxMainWindow() {
 
     m_pCoreServices->getControlIndicatorTimer()->setLegacyVsyncEnabled(false);
 
-    WaveformWidgetFactory::destroy();
+    qDebug() << t.elapsed(false).debugMillisWithUnit() << "deleting ControllerManager";
 
+    WaveformWidgetFactory::destroy();
     delete m_pGuiTick;
     delete m_pVisualsManager;
+
+    if (m_pOscReceiver) {
+        qDebug() << "[MIXXXMAINWINDOW] -> [OSCRECEIVER] -> Stopping OSC Receiver before shutdown";
+        m_pOscReceiver->stop();
+        if (m_oscThread.isRunning()) {
+            m_oscThread.quit();
+            if (!m_oscThread.wait(3000)) {
+                qWarning()
+                        << "[MIXXXMAINWINDOW] -> [OSCRECEIVER] -> OSC thread "
+                           "did not stop in time, forcing termination.";
+                m_oscThread.terminate();
+                m_oscThread.wait();
+            }
+        }
+        // m_pOscReceiver->deleteLater();
+        // m_pOscReceiver.reset();
+        qDebug() << "[MIXXXMAINWINDOW] -> [OSCRECEIVER] -> OSC Receiver stopped and cleaned up";
+    }
 }
 
 void MixxxMainWindow::initializeWindow() {
@@ -737,6 +794,7 @@ QDialog::DialogCode MixxxMainWindow::noOutputDlg(bool* continueClicked) {
 
             // This way of opening the dialog allows us to use it synchronously
             m_pPrefDlg->setWindowModality(Qt::ApplicationModal);
+            m_pPrefDlg->showSoundHardwarePage(mixxx::preferences::SoundHardwareTab::Output);
             m_pPrefDlg->exec();
             if (m_pPrefDlg->result() == QDialog::Accepted) {
                 return QDialog::Accepted;
@@ -933,6 +991,16 @@ void MixxxMainWindow::connectMenuBar() {
 
     if (m_pCoreServices->getLibrary()) {
         connect(m_pMenuBar,
+                &WMainMenuBar::searchInCurrentView,
+                m_pCoreServices->getLibrary().get(),
+                &Library::slotSearchInCurrentView,
+                Qt::UniqueConnection);
+        connect(m_pMenuBar,
+                &WMainMenuBar::searchInAllTracks,
+                m_pCoreServices->getLibrary().get(),
+                &Library::slotSearchInAllTracks,
+                Qt::UniqueConnection);
+        connect(m_pMenuBar,
                 &WMainMenuBar::createCrate,
                 m_pCoreServices->getLibrary().get(),
                 &Library::slotCreateCrate,
@@ -1072,64 +1140,168 @@ void MixxxMainWindow::slotOptionsPreferences() {
 }
 
 void MixxxMainWindow::slotNoVinylControlInputConfigured() {
-    QMessageBox::StandardButton btn = QMessageBox::warning(
-            this,
-            VersionStore::applicationName(),
-            tr("There is no input device selected for this vinyl control.\n"
-               "Please select an input device in the sound hardware preferences first."),
-            QMessageBox::Ok | QMessageBox::Cancel,
-            QMessageBox::Cancel);
-    if (btn == QMessageBox::Ok) {
+    if (m_noVinylInputDialog && m_noVinylInputDialog->isVisible()) {
+        // Don't show redundant dialogs.
+        // They might be triggered be repeated controller or keyboard and
+        // can lockup the GUI.
+        return;
+    }
+
+    if (!m_noVinylInputDialog) {
+        m_noVinylInputDialog = make_parented<QMessageBox>(
+                QMessageBox::Warning,
+                VersionStore::applicationName(),
+                tr("There is no input device selected for this vinyl control.\n"
+                   "Please select an input device in the sound hardware preferences first."),
+                QMessageBox::Ok | QMessageBox::Cancel,
+                this);
+        m_noVinylInputDialog->setWindowModality(Qt::ApplicationModal);
+        m_noVinylInputDialog->setDefaultButton(QMessageBox::Cancel);
+    }
+    m_noVinylInputDialog->exec();
+    if (m_noVinylInputDialog->clickedButton() ==
+            m_noVinylInputDialog->button(QMessageBox::Ok)) {
         m_pPrefDlg->show();
-        m_pPrefDlg->showSoundHardwarePage();
+        m_pPrefDlg->showSoundHardwarePage(mixxx::preferences::SoundHardwareTab::Input);
     }
 }
 
 void MixxxMainWindow::slotNoDeckPassthroughInputConfigured() {
-    QMessageBox::StandardButton btn = QMessageBox::warning(
-            this,
-            VersionStore::applicationName(),
-            tr("There is no input device selected for this passthrough control.\n"
-               "Please select an input device in the sound hardware preferences first."),
-            QMessageBox::Ok | QMessageBox::Cancel,
-            QMessageBox::Cancel);
-    if (btn == QMessageBox::Ok) {
+    if (m_noPassthroughInputDialog && m_noPassthroughInputDialog->isVisible()) {
+        // Don't show redundant dialogs.
+        // They might be triggered be repeated controller or keyboard and
+        // can lockup the GUI.
+        return;
+    }
+
+    if (!m_noPassthroughInputDialog) {
+        m_noPassthroughInputDialog = make_parented<QMessageBox>(
+                QMessageBox::Warning,
+                VersionStore::applicationName(),
+                tr("There is no input device selected for this passthrough control.\n"
+                   "Please select an input device in the sound hardware preferences first."),
+                QMessageBox::Ok | QMessageBox::Cancel,
+                this);
+        m_noPassthroughInputDialog->setWindowModality(Qt::ApplicationModal);
+        m_noPassthroughInputDialog->setDefaultButton(QMessageBox::Cancel);
+    }
+    m_noPassthroughInputDialog->exec();
+    if (m_noPassthroughInputDialog->clickedButton() ==
+            m_noPassthroughInputDialog->button(QMessageBox::Ok)) {
         m_pPrefDlg->show();
-        m_pPrefDlg->showSoundHardwarePage();
+        m_pPrefDlg->showSoundHardwarePage(mixxx::preferences::SoundHardwareTab::Input);
     }
 }
 
 void MixxxMainWindow::slotNoMicrophoneInputConfigured() {
-    QMessageBox::StandardButton btn = QMessageBox::question(
-            this,
-            VersionStore::applicationName(),
-            tr("There is no input device selected for this microphone.\n"
-               "Do you want to select an input device?"),
-            QMessageBox::Ok | QMessageBox::Cancel,
-            QMessageBox::Cancel);
-    if (btn == QMessageBox::Ok) {
+    if (m_noMicInputDialog && m_noMicInputDialog->isVisible()) {
+        // Don't show redundant dialogs.
+        // They might be triggered be repeated controller or keyboard and
+        // can lockup the GUI.
+        return;
+    }
+
+    if (!m_noMicInputDialog) {
+        m_noMicInputDialog = make_parented<QMessageBox>(
+                QMessageBox::Warning,
+                VersionStore::applicationName(),
+                tr("There is no input device selected for this microphone.\n"
+                   "Do you want to select an input device?"),
+                QMessageBox::Ok | QMessageBox::Cancel,
+                this);
+        m_noMicInputDialog->setWindowModality(Qt::ApplicationModal);
+        m_noMicInputDialog->setDefaultButton(QMessageBox::Cancel);
+    }
+    m_noMicInputDialog->exec();
+    if (m_noMicInputDialog->clickedButton() ==
+            m_noMicInputDialog->button(QMessageBox::Ok)) {
         m_pPrefDlg->show();
-        m_pPrefDlg->showSoundHardwarePage();
+        m_pPrefDlg->showSoundHardwarePage(mixxx::preferences::SoundHardwareTab::Input);
     }
 }
 
 void MixxxMainWindow::slotNoAuxiliaryInputConfigured() {
-    QMessageBox::StandardButton btn = QMessageBox::question(
-            this,
-            VersionStore::applicationName(),
-            tr("There is no input device selected for this auxiliary.\n"
-               "Do you want to select an input device?"),
-            QMessageBox::Ok | QMessageBox::Cancel,
-            QMessageBox::Cancel);
-    if (btn == QMessageBox::Ok) {
+    if (m_noAuxInputDialog && m_noAuxInputDialog->isVisible()) {
+        // Don't show redundant dialogs.
+        // They might be triggered be repeated controller or keyboard and
+        // can lockup the GUI.
+        return;
+    }
+
+    if (!m_noAuxInputDialog) {
+        m_noAuxInputDialog = make_parented<QMessageBox>(
+                QMessageBox::Warning,
+                VersionStore::applicationName(),
+                tr("There is no input device selected for this auxiliary.\n"
+                   "Do you want to select an input device?"),
+                QMessageBox::Ok | QMessageBox::Cancel,
+                this);
+        m_noAuxInputDialog->setWindowModality(Qt::ApplicationModal);
+        m_noAuxInputDialog->setDefaultButton(QMessageBox::Cancel);
+    }
+    m_noAuxInputDialog->exec();
+    if (m_noAuxInputDialog->clickedButton() ==
+            m_noAuxInputDialog->button(QMessageBox::Ok)) {
         m_pPrefDlg->show();
-        m_pPrefDlg->showSoundHardwarePage();
+        m_pPrefDlg->showSoundHardwarePage(mixxx::preferences::SoundHardwareTab::Input);
     }
 }
 
 void MixxxMainWindow::slotHelpAbout() {
     DlgAbout* about = new DlgAbout;
     about->show();
+}
+
+void MixxxMainWindow::slotLibraryScanSummaryDlg(const LibraryScanResultSummary& result) {
+    if (!m_pCoreServices->getSettings()->getValue<bool>(
+                mixxx::library::prefs::kShowScanSummaryConfigKey, true)) {
+        return;
+    }
+
+    // Don't show the report dialog when the scan is run during startup and no
+    // noteworthy changes have been detected.
+    if (result.autoscan &&
+            result.numNewTracks == 0 &&
+            result.numNewMissingTracks == 0 &&
+            result.numRediscoveredTracks == 0) {
+        return;
+    }
+
+    QString summary =
+            tr("Scan took %1").arg(result.durationString) + QStringLiteral("<br><br>");
+    if (result.numNewTracks == 0 && result.numMovedTracks == 0 && result.numNewMissingTracks == 0) {
+        summary += tr("No changes detected.") +
+                QStringLiteral("<br><b>") +
+                tr("%1 tracks in total").arg(QString::number(result.tracksTotal)) +
+                QStringLiteral("</b>");
+    } else {
+        if (result.numNewTracks != 0) {
+            summary += tr("%1 new tracks found").arg(QString::number(result.numNewTracks)) +
+                    QStringLiteral("<br>");
+        }
+        if (result.numMovedTracks != 0) {
+            summary += tr("%1 moved tracks detected").arg(QString::number(result.numMovedTracks)) +
+                    QStringLiteral("<br>");
+        }
+        if (result.numNewMissingTracks != 0) {
+            summary += tr("%1 tracks are missing (%2 total)")
+                               .arg(QString::number(result.numNewMissingTracks),
+                                       QString::number(result.numMissingTracks));
+        }
+        if (result.numRediscoveredTracks != 0) {
+            summary += QStringLiteral("<br>") +
+                    tr("%1 tracks have been rediscovered")
+                            .arg(QString::number(result.numRediscoveredTracks));
+        }
+        summary += QStringLiteral("<br><br><b>") +
+                tr("%1 tracks in total").arg(QString::number(result.tracksTotal)) +
+                QStringLiteral("</b>");
+    }
+    QMessageBox* pMsg = new QMessageBox();
+    pMsg->setTextFormat(Qt::RichText); // required to get bold text with <b> tags
+    pMsg->setWindowTitle(tr("Library scan finished"));
+    pMsg->setText(summary);
+    pMsg->show();
 }
 
 void MixxxMainWindow::slotShowKeywheel(bool toggle) {
@@ -1159,6 +1331,7 @@ void MixxxMainWindow::slotTooltipModeChanged(mixxx::preferences::Tooltips tt) {
 
 void MixxxMainWindow::rebootMixxxView() {
     qDebug() << "Now in rebootMixxxView...";
+    m_inRebootMixxxView = true;
 
     ScopedWaitCursor cursor;
     // safe geometry for later restoration
@@ -1192,6 +1365,7 @@ void MixxxMainWindow::rebootMixxxView() {
         QMessageBox::critical(this,
                               tr("Error in skin file"),
                               tr("The selected skin cannot be loaded."));
+        m_inRebootMixxxView = false;
         // m_pWidgetParent is NULL, we can't continue.
         return;
     }
@@ -1220,6 +1394,7 @@ void MixxxMainWindow::rebootMixxxView() {
         setGeometry(initGeometry);
     }
 
+    m_inRebootMixxxView = false;
     qDebug() << "rebootMixxxView DONE";
 }
 
@@ -1250,8 +1425,9 @@ void MixxxMainWindow::tryParseAndSetDefaultStyleSheet() {
 
 /// Catch ToolTip and WindowStateChange events
 bool MixxxMainWindow::eventFilter(QObject* obj, QEvent* event) {
-    if (event->type() == QEvent::ToolTip) {
-        // always show tooltips in the preferences window
+    // Always show tooltips if Ctrl is held down
+    if (event->type() == QEvent::ToolTip &&
+            !QApplication::keyboardModifiers().testFlag(Qt::ControlModifier)) {
         QWidget* activeWindow = QApplication::activeWindow();
         if (activeWindow &&
                 QLatin1String(activeWindow->metaObject()->className()) !=
@@ -1310,7 +1486,9 @@ bool MixxxMainWindow::eventFilter(QObject* obj, QEvent* event) {
             if (!m_supportsGlobalMenuBar || isFullScreenNow)
 #endif
             {
-                alwaysHideMenuBarDlg();
+                if (!m_inRebootMixxxView) {
+                    alwaysHideMenuBarDlg();
+                }
                 slotUpdateMenuBarAltKeyConnection();
             }
 #endif
@@ -1433,4 +1611,85 @@ void MixxxMainWindow::initializationProgressUpdate(int progress, const QString& 
         m_pLaunchImage->progress(progress, serviceName);
     }
     qApp->processEvents();
+}
+
+void MixxxMainWindow::oscEnable() {
+    // Check if m_pCoreServices is ready
+    if (!m_pCoreServices) {
+        qDebug() << "[MIXXXMAINWINDOW] -> m_pCoreServices is not ready, "
+                    "delaying OSC initialization...";
+        QTimer::singleShot(3000, this, [this]() { oscEnable(); }); // Retry after 3 seconds
+        return;
+    }
+
+    // Check if OSC is enabled in settings
+    if (m_pCoreServices->getSettings()->getValue<bool>(ConfigKey("[OSC]", "OscEnabled"))) {
+        qDebug() << "[MIXXXMAINWINDOW] -> Mixxx OSC Service Enabled";
+        int ckOscPortInInt = m_pCoreServices->getSettings()
+                                     ->getValue(ConfigKey("[OSC]", "OscPortIn"))
+                                     .toInt();
+        if (!m_pOscReceiver) {
+            m_pOscReceiver = std::make_unique<OscReceiver>(m_pCoreServices->getSettings());
+            m_pOscReceiver->moveToThread(&m_oscThread);
+
+            qDebug() << "[MIXXXMAINWINDOW] -> Calling loadOscConfiguration";
+            m_pOscReceiver->loadOscConfiguration(m_pCoreServices->getSettings());
+
+            // Add a 3-second delay before starting the thread
+            QTimer::singleShot(3000, this, [this, ckOscPortInInt]() {
+                qDebug() << "[MIXXXMAINWINDOW] -> Starting OSC thread after delay...";
+                connect(&m_oscThread,
+                        &QThread::started,
+                        m_pOscReceiver.get(),
+                        [this, ckOscPortInInt]() {
+                            m_pOscReceiver->startOscReceiver(ckOscPortInInt);
+                        });
+                connect(&m_oscThread,
+                        &QThread::finished,
+                        this,
+                        &MixxxMainWindow::onOscThreadFinished);
+                m_oscThread.start();
+
+                // Start a timer to periodically check responsiveness
+                QTimer* responsivenessTimer = new QTimer(this);
+                connect(responsivenessTimer, &QTimer::timeout, this, [this]() {
+                    if (m_pOscReceiver) {
+                        m_pOscReceiver->checkResponsiveness();
+                    }
+                });
+                responsivenessTimer->start(5000); // Check every 5 seconds
+            });
+        }
+    } else {
+        qDebug() << "[MIXXXMAINWINDOW] -> Mixxx OSC Service NOT Enabled";
+
+        if (m_pOscReceiver) {
+            // Ensure stop is implemented properly in OscReceiver
+            m_pOscReceiver->stop();
+            // Request interruption
+            m_oscThread.requestInterruption();
+            // Quit the thread gracefully
+            m_oscThread.quit();
+            // Wait for the thread to finish with a timeout
+            if (!m_oscThread.wait(3000)) {
+                qWarning() << "[MIXXXMAINWINDOW] -> OSC thread did not stop in "
+                              "time, forcing termination.";
+                m_oscThread.terminate(); // Forcibly terminate if not stopped in time
+            }
+            // Reset the receiver pointer & delete the object
+            m_pOscReceiver.reset();
+        }
+    }
+}
+
+void MixxxMainWindow::onOscThreadFinished() {
+    qDebug() << "[MIXXXMAINWINDOW] -> OSC thread finished";
+
+    // Safely delete the receiver object once the thread has finished
+    if (m_pOscReceiver) {
+        // Ensure the receiver object is deleted in the main thread
+        m_pOscReceiver->deleteLater();
+        // Reset the unique pointer to null
+        m_pOscReceiver.reset();
+    }
 }

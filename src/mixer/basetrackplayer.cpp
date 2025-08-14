@@ -32,6 +32,13 @@ inline double trackColorToDouble(mixxx::RgbColor::optional_t color) {
 }
 } // namespace
 
+// EveOSC
+extern std::atomic<bool> s_oscEnabled;
+void oscChangedPlayState(
+        const QString& oscGroup,
+        float playstate);
+// EveOSC
+
 BaseTrackPlayer::BaseTrackPlayer(PlayerManager* pParent, const QString& group)
         : BasePlayer(pParent, group) {
 }
@@ -191,6 +198,13 @@ BaseTrackPlayerImpl::BaseTrackPlayerImpl(
             &ControlObject::valueChanged,
             this,
             &BaseTrackPlayerImpl::slotLoadTrackFromSampler);
+    m_pLoadTrackFromPreviewDeck = std::make_unique<ControlObject>(
+            ConfigKey(getGroup(), "LoadTrackFromPreviewDeck"),
+            false);
+    connect(m_pLoadTrackFromPreviewDeck.get(),
+            &ControlObject::valueChanged,
+            this,
+            &BaseTrackPlayerImpl::slotLoadTrackFromPreviewDeck);
 
     // Waveform controls
     // This acts somewhat like a ControlPotmeter, but the normal _up/_down methods
@@ -288,10 +302,8 @@ BaseTrackPlayerImpl::BaseTrackPlayerImpl(
 #ifdef __STEM__
     m_pStemColors.reserve(mixxx::kMaxSupportedStems);
     QString group = getGroup();
-    for (int stemIdx = 1; stemIdx <= mixxx::kMaxSupportedStems; stemIdx++) {
-        QString stemGroup = QStringLiteral("%1Stem%2]")
-                                    .arg(group.left(group.size() - 1),
-                                            QString::number(stemIdx));
+    for (int stemIdx = 0; stemIdx < mixxx::kMaxSupportedStems; stemIdx++) {
+        QString stemGroup = EngineDeck::getGroupForStem(group, stemIdx);
         m_pStemColors.emplace_back(std::make_unique<ControlObject>(
                 ConfigKey(stemGroup, QStringLiteral("color"))));
         m_pStemColors.back()->set(kNoTrackColor);
@@ -305,7 +317,7 @@ BaseTrackPlayerImpl::~BaseTrackPlayerImpl() {
 }
 
 TrackPointer BaseTrackPlayerImpl::loadFakeTrack(bool bPlay, double filebpm) {
-    TrackPointer pTrack(Track::newTemporary());
+    TrackPointer pTrack = Track::newTemporary();
     pTrack->setAudioProperties(
             mixxx::kEngineChannelOutputCount,
             mixxx::audio::SampleRate(44100),
@@ -811,6 +823,11 @@ void BaseTrackPlayerImpl::slotLoadTrackFromDeck(double d) {
     loadTrackFromGroup(PlayerManager::groupForDeck(deck - 1));
 }
 
+void BaseTrackPlayerImpl::slotLoadTrackFromPreviewDeck(double d) {
+    int deck = static_cast<int>(d);
+    loadTrackFromGroup(PlayerManager::groupForPreviewDeck(deck - 1));
+}
+
 void BaseTrackPlayerImpl::slotLoadTrackFromSampler(double d) {
     int sampler = static_cast<int>(d);
     loadTrackFromGroup(PlayerManager::groupForSampler(sampler - 1));
@@ -875,19 +892,26 @@ void BaseTrackPlayerImpl::slotSetReplayGain(mixxx::ReplayGain replayGain) {
     }
 }
 
-void BaseTrackPlayerImpl::slotAdjustReplayGain(mixxx::ReplayGain replayGain) {
+void BaseTrackPlayerImpl::slotAdjustReplayGain(
+        mixxx::ReplayGain replayGain, const QString& requestingPlayerGroup) {
     const double factor = m_pReplayGain->get() / replayGain.getRatio();
     const double newPregain = m_pPreGain->get() * factor;
 
     // There is a very slight chance that there will be a buffer call in between these sets.
     // Therefore, we first adjust the control that is being lowered before the control
     // that is being raised.  Worst case, the volume goes down briefly before rectifying.
+    // Only reset Gain if this player requested the change, ie. avoid Gain change
+    // in other players this track is loaded to.
     if (factor < 1.0) {
-        m_pPreGain->set(newPregain);
+        if (requestingPlayerGroup == m_group) {
+            m_pPreGain->set(newPregain);
+        }
         setReplayGain(replayGain.getRatio());
     } else {
         setReplayGain(replayGain.getRatio());
-        m_pPreGain->set(newPregain);
+        if (requestingPlayerGroup == m_group) {
+            m_pPreGain->set(newPregain);
+        }
     }
 }
 
@@ -954,6 +978,11 @@ void BaseTrackPlayerImpl::slotPlayToggled(double value) {
     if (value == 0 && m_replaygainPending) {
         setReplayGain(m_pLoadedTrack->getReplayGain().getRatio());
     }
+    //  EveOSC begin
+    if (s_oscEnabled.load()) {
+        oscChangedPlayState(getGroup(), (float)value);
+    }
+    //  EveOSC end
 }
 
 EngineDeck* BaseTrackPlayerImpl::getEngineDeck() const {
@@ -1049,7 +1078,7 @@ void BaseTrackPlayerImpl::slotUpdateReplayGainFromPregain(double pressed) {
     if (gain == 1.0) {
         return;
     }
-    m_pLoadedTrack->adjustReplayGainFromPregain(gain);
+    m_pLoadedTrack->adjustReplayGainFromPregain(gain, m_group);
 }
 
 void BaseTrackPlayerImpl::setReplayGain(double value) {

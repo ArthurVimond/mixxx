@@ -156,7 +156,7 @@ class Track : public QObject {
 
     void setReplayGain(const mixxx::ReplayGain&);
     // Adjust ReplayGain by multiplying the given gain amount.
-    void adjustReplayGainFromPregain(double);
+    void adjustReplayGainFromPregain(double gain, const QString& requestingPlayerGroup);
     // Returns ReplayGain
     mixxx::ReplayGain getReplayGain() const;
 
@@ -296,6 +296,11 @@ class Track : public QObject {
     void setMainCuePosition(mixxx::audio::FramePos position);
     /// Shift all cues by a constant offset
     void shiftCuePositionsMillis(mixxx::audio::FrameDiff_t milliseconds);
+    /// Set hoctues' indices sorted by their frame position.
+    /// If compress is true, indices are consecutive and start at 0.
+    /// Set false to sort only, ie. keep empty hotcues before and in between.
+    void setHotcueIndicesSortedByPosition(HotcueSortMode sortMode);
+
     // Call when analysis is done.
     void analysisFinished();
 
@@ -322,6 +327,7 @@ class Track : public QObject {
     }
     CuePointer findCueByType(mixxx::CueType type) const; // NOTE: Cannot be used for hotcues.
     CuePointer findCueById(DbId id) const;
+    CuePointer findHotcueByIndex(int idx) const;
     void removeCue(const CuePointer& pCue);
     void removeCuesOfType(mixxx::CueType);
     QList<CuePointer> getCuePoints() const {
@@ -329,7 +335,7 @@ class Track : public QObject {
         // lock thread-unsafe copy constructors of QList
         return m_cuePoints;
     }
-
+    void swapHotcues(int a, int b);
     void setCuePoints(const QList<CuePointer>& cuePoints);
 
 #ifdef __STEM__
@@ -474,7 +480,7 @@ class Track : public QObject {
     void replayGainUpdated(mixxx::ReplayGain replayGain);
     // This signal indicates that ReplayGain is being adjusted, and pregains should be
     // adjusted in the opposite direction to compensate (no audible change).
-    void replayGainAdjusted(const mixxx::ReplayGain&);
+    void replayGainAdjusted(const mixxx::ReplayGain&, const QString& requestingPlayerGroup);
     void colorUpdated(const mixxx::RgbColor::optional_t& color);
     void ratingUpdated(int rating);
     void cuesUpdated();

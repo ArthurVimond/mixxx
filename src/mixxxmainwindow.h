@@ -2,6 +2,7 @@
 
 #include <QMainWindow>
 #include <QString>
+#include <QThread>
 #include <memory>
 
 #include "preferences/constants.h"
@@ -17,6 +18,8 @@ class GuiTick;
 class LaunchImage;
 class VisualsManager;
 class WMainMenuBar;
+class OscReceiver;
+struct LibraryScanResultSummary;
 
 namespace mixxx {
 
@@ -63,7 +66,9 @@ class MixxxMainWindow : public QMainWindow {
     void slotOptionsPreferences();
     /// show the about dialog
     void slotHelpAbout();
-    // show keywheel
+    /// show popup with library scan results
+    void slotLibraryScanSummaryDlg(const LibraryScanResultSummary& result);
+    /// show keywheel
     void slotShowKeywheel(bool toggle);
     /// toggle full screen mode
     void slotViewFullScreen(bool toggle);
@@ -104,6 +109,10 @@ class MixxxMainWindow : public QMainWindow {
   private:
     void initializeWindow();
     void checkDirectRendering();
+    // EveOSC
+    void oscEnable();
+    void onOscThreadFinished();
+    // EveOSC
 
     /// Load skin to a QWidget that we set as the central widget.
     bool loadConfiguredSkin();
@@ -129,6 +138,11 @@ class MixxxMainWindow : public QMainWindow {
     Qt::WindowStates m_prevState;
 #endif
 
+    parented_ptr<QMessageBox> m_noVinylInputDialog;
+    parented_ptr<QMessageBox> m_noPassthroughInputDialog;
+    parented_ptr<QMessageBox> m_noMicInputDialog;
+    parented_ptr<QMessageBox> m_noAuxInputDialog;
+
     std::shared_ptr<mixxx::skin::SkinLoader> m_pSkinLoader;
     GuiTick* m_pGuiTick;
     VisualsManager* m_pVisualsManager;
@@ -137,6 +151,7 @@ class MixxxMainWindow : public QMainWindow {
 #ifdef __LINUX__
     const bool m_supportsGlobalMenuBar;
 #endif
+    bool m_inRebootMixxxView;
 
     DlgDeveloperTools* m_pDeveloperToolsDlg;
 
@@ -153,4 +168,6 @@ class MixxxMainWindow : public QMainWindow {
     mixxx::preferences::ScreenSaver m_inhibitScreensaver;
 
     QSet<ControlObject*> m_skinCreatedControls;
+    QThread m_oscThread;
+    std::unique_ptr<OscReceiver> m_pOscReceiver;
 };
